@@ -6,6 +6,11 @@ Downloads subject PDFs for 42 projects, extracts their text, and keeps a
 versioned history. On each run it compares the new text against the last
 saved version and records a word-level diff in history.json.
 
+PDF discovery order:
+  1. API fields (pdf, attachments, project_sessions > uploads / subject)
+  2. CDN probe — tries common filenames at /pdf/pdf/{project_id}/
+  3. projects.intra.42.fr scraping (needs --session-cookie or bearer token)
+
 Dependencies (install once):
     pip install pypdf requests
 
@@ -24,6 +29,8 @@ Usage:
     python fetch_42_subjects.py
     python fetch_42_subjects.py --keywords "python,dslr"
     python fetch_42_subjects.py --dry-run    # auth + list projects, no downloads
+    python fetch_42_subjects.py --scan-previous          # discover older PDF versions
+    python fetch_42_subjects.py --scan-previous --scan-range 500
 """
 
 import argparse
@@ -41,9 +48,12 @@ from urllib.parse import urlencode, urlparse, parse_qs
 from urllib.request import urlopen, Request
 from urllib.error import HTTPError
 
-UA       = "Mozilla/5.0 (X11; Linux x86_64; rv:124.0) Gecko/20100101 Firefox/124.0"
-API_BASE = "https://api.intra.42.fr"
-CURSUS_ID = 21
+UA            = "Mozilla/5.0 (X11; Linux x86_64; rv:124.0) Gecko/20100101 Firefox/124.0"
+API_BASE      = "https://api.intra.42.fr"
+PROJECTS_BASE = "https://projects.intra.42.fr"
+CDN_PDF_BASE  = "https://cdn.intra.42.fr/pdf/pdf"
+CDN_FILENAMES = ("en.subject.pdf", "fr.subject.pdf", "subject.pdf")
+CURSUS_ID     = 21
 
 
 # ── .env loader ───────────────────────────────────────────────────────────────
@@ -194,9 +204,20 @@ def get_all_pages(path: str, token: str) -> list:
 
 
 def download_bytes(url: str, token: str) -> bytes:
-    req = Request(url, headers={"Authorization": f"Bearer {token}", "User-Agent": UA})
-    with urlopen(req) as resp:
-        return resp.read()
+    """Download a URL. Tries with Bearer auth first, then without (for public CDN URLs)."""
+    headers = {"User-Agent": UA}
+    for auth in (f"Bearer {token}", None):
+        hdrs = {**headers, "Authorization": auth} if auth else headers
+        req = Request(url, headers=hdrs)
+        try:
+            with urlopen(req) as resp:
+                return resp.read()
+        except HTTPError as e:
+            # On auth failure, retry without auth (CDN URLs are public)
+            if auth and e.code in (401, 403):
+                continue
+            raise
+    raise RuntimeError(f"download failed (auth and no-auth both failed): {url}")
 
 
 # ── PDF text extraction ───────────────────────────────────────────────────────
@@ -295,9 +316,9 @@ def save_cache(summaries, cache_file):
 
 def find_subject_url(project_detail: dict) -> str | None:
     """
-    Look for a PDF subject URL in the project detail.
-    Checks: attachments, project_sessions > project_gitlab_path,
-    and the dedicated 'pdf' field some projects have.
+    Look for a PDF subject URL in the project detail JSON.
+    Checks: pdf field, attachments, project_sessions > uploads,
+    and project_sessions > subject.
     """
     # Direct pdf field
     if project_detail.get("pdf"):
@@ -309,8 +330,15 @@ def find_subject_url(project_detail: dict) -> str | None:
         if url.lower().endswith(".pdf"):
             return url
 
-    # project_sessions may contain a subject url
+    # project_sessions may contain uploads or a subject url
     for session in (project_detail.get("project_sessions") or []):
+        # Check uploads array (where 42 API stores subject PDFs)
+        for upload in (session.get("uploads") or []):
+            u = upload.get("url") or upload.get("file_url") or upload.get("link") or ""
+            if u:
+                return u
+
+        # Fallback: check the subject field
         url = session.get("subject", {})
         if isinstance(url, dict):
             u = url.get("url") or url.get("file_url") or ""
@@ -320,6 +348,171 @@ def find_subject_url(project_detail: dict) -> str | None:
             return url
 
     return None
+
+
+def scrape_subject_pdf_url(slug: str, token: str, session_cookie: str = None) -> str | None:
+    """
+    Discover the real CDN PDF URL by scraping the project page on
+    projects.intra.42.fr.  Tries bearer-token auth first, then falls
+    back to a session cookie if one was supplied.
+
+    Used as a last resort when the API fields are empty and CDN probing
+    with common filenames also fails.
+    """
+    for page_url in (
+        f"{PROJECTS_BASE}/projects/{slug}",
+        f"{PROJECTS_BASE}/{slug}",
+    ):
+        # Try bearer token first, then session cookie
+        auth_variants = []
+        auth_variants.append({
+            "Authorization": f"Bearer {token}",
+            "User-Agent": UA,
+        })
+        if session_cookie:
+            auth_variants.append({
+                "User-Agent": UA,
+                "Cookie": f"_intra_42_session_production={session_cookie}",
+            })
+
+        for headers in auth_variants:
+            req = Request(page_url, headers=headers)
+            try:
+                with urlopen(req) as resp:
+                    html = resp.read().decode("utf-8", errors="replace")
+            except Exception:
+                continue
+
+            # Look for CDN PDF URLs in the HTML
+            m = re.search(
+                r'https://cdn\.intra\.42\.fr/pdf/pdf/\d+/[\w.]+\.pdf',
+                html,
+            )
+            if m:
+                return m.group(0)
+
+    return None
+
+
+# ── CDN probing ───────────────────────────────────────────────────────────────
+
+def _cdn_head_ok(url: str, token: str) -> bool:
+    """Return True if a HEAD (or GET) request to *url* succeeds (HTTP 200/206)."""
+    for auth in (f"Bearer {token}", None):
+        headers = {"User-Agent": UA}
+        if auth:
+            headers["Authorization"] = auth
+        for method in ("HEAD", "GET"):
+            hdrs = dict(headers)
+            if method == "GET":
+                hdrs["Range"] = "bytes=0-0"   # avoid downloading the full file
+            req = Request(url, method=method, headers=hdrs)
+            try:
+                with urlopen(req) as resp:
+                    return True               # 200 or 206
+            except HTTPError as e:
+                if method == "HEAD" and e.code == 405:
+                    continue                  # HEAD not allowed, try GET
+                if auth and e.code in (401, 403):
+                    break                     # try without auth
+                return False                  # 404 or other → file absent
+            except Exception:
+                break
+    return False
+
+
+def probe_cdn_pdf(project_id: int, token: str) -> str | None:
+    """
+    Probe the 42 CDN for a subject PDF at ``/pdf/pdf/{project_id}/``.
+
+    The directory may exist (HTTP 403 on the bare path) while the
+    commonly-assumed filename ``en.subject.pdf`` yields 404.  This
+    function tries every name in CDN_FILENAMES with and without auth.
+    """
+    for filename in CDN_FILENAMES:
+        url = f"{CDN_PDF_BASE}/{project_id}/{filename}"
+        if _cdn_head_ok(url, token):
+            return url
+    return None
+
+
+def extract_cdn_id(url: str) -> int | None:
+    """Extract the numeric upload / project ID from a cdn.intra.42.fr URL."""
+    m = re.search(r'cdn\.intra\.42\.fr/pdf/pdf/(\d+)/', url)
+    return int(m.group(1)) if m else None
+
+
+def discover_previous_versions(
+    current_cdn_id: int,
+    known_filename: str,
+    project_slug: str,
+    token: str,
+    scan_range: int = 200,
+    max_versions: int = 10,
+) -> list[dict]:
+    """
+    Scan the CDN **backward** from *current_cdn_id* looking for earlier
+    uploads whose first-page text matches *project_slug*.
+
+    Returns ``[{"cdn_id": int, "url": str, "pdf_bytes": bytes,
+                "text": str}, ...]`` ordered **oldest-first**.
+    """
+    slug_normalised = project_slug.lower().replace("-", " ")
+    slug_words = [w for w in slug_normalised.split() if len(w) > 1]
+
+    versions: list[dict] = []
+    consecutive_misses = 0
+
+    for probe_id in range(current_cdn_id - 1,
+                          max(0, current_cdn_id - scan_range - 1), -1):
+        # Try the known filename first, then the other common names
+        filenames = [known_filename] + [f for f in CDN_FILENAMES
+                                         if f != known_filename]
+        pdf_url = None
+        for fn in filenames:
+            candidate = f"{CDN_PDF_BASE}/{probe_id}/{fn}"
+            if _cdn_head_ok(candidate, token):
+                pdf_url = candidate
+                break
+
+        if not pdf_url:
+            consecutive_misses += 1
+            if consecutive_misses >= 30:
+                break
+            continue
+
+        consecutive_misses = 0
+
+        # Download the PDF and check if it belongs to the same project
+        try:
+            pdf_bytes = download_bytes(pdf_url, token)
+        except Exception:
+            continue
+
+        text = extract_text_from_pdf(pdf_bytes)
+        first_page = text[:1000].lower()
+
+        # Match: full normalised slug in first page, or ≥⅔ of the words
+        if slug_normalised in first_page:
+            match = True
+        else:
+            hits = sum(1 for w in slug_words if w in first_page)
+            match = hits >= max(2, len(slug_words) * 2 // 3)
+
+        if match:
+            versions.append({
+                "cdn_id":    probe_id,
+                "url":       pdf_url,
+                "pdf_bytes": pdf_bytes,
+                "text":      text,
+            })
+            if len(versions) >= max_versions:
+                break
+
+        time.sleep(0.3)
+
+    versions.reverse()   # oldest first
+    return versions
 
 
 # ── History management ────────────────────────────────────────────────────────
@@ -357,6 +550,16 @@ def main():
                         help="Ignore cache and force a fresh fetch.")
     parser.add_argument("--dry-run",       action="store_true",
                         help="Authenticate and list projects but don't download anything")
+    parser.add_argument("--session-cookie", default=os.getenv("FT_SESSION_COOKIE"),
+                        help="Value of _intra_42_session_production cookie for "
+                             "projects.intra.42.fr scraping (optional). "
+                             "Needed when the API does not expose PDF URLs.")
+    parser.add_argument("--scan-previous",  action="store_true",
+                        help="Scan the CDN backward from each project's CDN ID "
+                             "to discover older versions of its subject PDF.")
+    parser.add_argument("--scan-range",     type=int,
+                        default=int(os.getenv("FT_SCAN_RANGE", "200")),
+                        help="How many CDN IDs to probe backward (default: 200).")
     args = parser.parse_args()
 
     if not args.client_id or not args.client_secret:
@@ -424,26 +627,15 @@ def main():
             time.sleep(0.25)
             continue
 
-        # Find subject PDF URL
+        # Find subject PDF URL — try API fields → CDN probe → web scrape
         pdf_url = find_subject_url(detail)
         if not pdf_url:
-            # Print the keys available so we can find where the PDF actually is
-            top_keys = list(detail.keys())
-            session_keys = list((detail.get("project_sessions") or [{}])[0].keys()) if detail.get("project_sessions") else []
+            pdf_url = probe_cdn_pdf(summary["id"], token)
+        if not pdf_url:
+            pdf_url = scrape_subject_pdf_url(slug, token, args.session_cookie)
+
+        if not pdf_url:
             print(f"    [skip] no subject PDF found", flush=True)
-            print(f"    [debug] top-level keys: {top_keys}", flush=True)
-            if session_keys:
-                print(f"    [debug] project_sessions[0] keys: {session_keys}", flush=True)
-            # Dump uploads and attachments raw so we can see the structure
-            for session in (detail.get("project_sessions") or [])[:1]:
-                print(f"    [debug] uploads     = {session.get('uploads')}", flush=True)
-            print(f"    [debug] attachments = {detail.get('attachments')}", flush=True)
-            print(f"    [debug] git_id      = {detail.get('git_id')}", flush=True)
-            print(f"    [debug] repository  = {detail.get('repository')}", flush=True)
-            print(f"    [debug] videos      = {detail.get('videos')}", flush=True)
-            # Print every session's campus_id so we know which session is ours
-            for idx, s in enumerate(detail.get("project_sessions") or []):
-                print(f"    [debug] session[{idx}] campus_id={s.get('campus_id')} uploads={s.get('uploads')}", flush=True)
             skipped += 1
             time.sleep(0.25)
             continue
@@ -453,6 +645,15 @@ def main():
         # Download PDF
         try:
             pdf_bytes = download_bytes(pdf_url, token)
+        except HTTPError as e:
+            if e.code == 404:
+                print(f"    [skip] PDF not found (404)", flush=True)
+                skipped += 1
+            else:
+                print(f"    [warn] download failed: HTTP {e.code}", flush=True)
+                errors += 1
+            time.sleep(0.25)
+            continue
         except Exception as e:
             print(f"    [warn] download failed: {e}", flush=True)
             errors += 1
@@ -518,12 +719,77 @@ def main():
 
         changed += 1
         save_history(history, history_file)  # save after each project in case of interruption
+
+        # ── Scan for previous versions on the CDN ─────────────────────────
+        if args.scan_previous and pdf_url:
+            cdn_id = extract_cdn_id(pdf_url)
+            known_fn = pdf_url.rsplit("/", 1)[-1]
+            if cdn_id:
+                print(f"    ↻ scanning CDN backward from {cdn_id} "
+                      f"(range {args.scan_range}) …", flush=True)
+                known_hashes = {v["hash"] for v in proj_history["versions"]}
+                prev = discover_previous_versions(
+                    cdn_id, known_fn, slug, token, args.scan_range,
+                )
+                new_prev = 0
+                for pv in prev:
+                    pv_hash = hashlib.sha256(pv["pdf_bytes"]).hexdigest()
+                    if pv_hash in known_hashes:
+                        continue
+                    known_hashes.add(pv_hash)
+
+                    pv_prefix = f"cdn-{pv['cdn_id']}"
+                    pv_pdf  = f"{pv_prefix}.pdf"
+                    pv_txt  = f"{pv_prefix}.txt"
+                    pv_diff = f"{pv_prefix}.diff.json"
+
+                    (proj_dir / pv_pdf).write_bytes(pv["pdf_bytes"])
+                    (proj_dir / pv_txt).write_text(pv["text"], encoding="utf-8")
+                    pv_chunks = [{"type": "equal", "text": pv["text"]}]
+                    (proj_dir / pv_diff).write_text(
+                        json.dumps(pv_chunks, ensure_ascii=False, indent=2),
+                        encoding="utf-8",
+                    )
+
+                    proj_history["versions"].insert(0, {
+                        "discovered_at": run_ts,
+                        "hash":          pv_hash,
+                        "pdf_file":      pv_pdf,
+                        "text_file":     pv_txt,
+                        "diff_file":     pv_diff,
+                        "words_added":   len(pv["text"].split()),
+                        "words_removed": 0,
+                        "cdn_id":        pv["cdn_id"],
+                        "source":        "cdn_scan",
+                    })
+                    new_prev += 1
+
+                if new_prev:
+                    print(f"    ✓ {new_prev} previous version(s) discovered",
+                          flush=True)
+                    save_history(history, history_file)
+                else:
+                    print(f"    (no previous versions found)", flush=True)
+
         time.sleep(0.5)
 
     print(f"\n✓ Done — {changed} changed, {skipped} no PDF, {errors} errors")
     print(f"  History saved to {history_file}")
     print(f"  PDFs saved under {subjects_dir}/")
     print(f"  Open dashboard.html to explore the history.")
+
+    if skipped and not args.session_cookie:
+        print()
+        print("  ╭─ Tip ──────────────────────────────────────────────────────────╮")
+        print("  │ Some projects don't expose PDF URLs through the API.           │")
+        print("  │ To fix this, supply your 42 intra session cookie so the tool   │")
+        print("  │ can scrape the real CDN URLs from projects.intra.42.fr:        │")
+        print("  │                                                                │")
+        print("  │   1. Log into projects.intra.42.fr in your browser             │")
+        print("  │   2. Open DevTools → Application → Cookies                     │")
+        print("  │   3. Copy the value of _intra_42_session_production            │")
+        print("  │   4. Set FT_SESSION_COOKIE in .env or pass --session-cookie    │")
+        print("  ╰────────────────────────────────────────────────────────────────╯")
 
 
 if __name__ == "__main__":

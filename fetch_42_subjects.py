@@ -43,6 +43,7 @@ from urllib.error import HTTPError
 
 UA       = "Mozilla/5.0 (X11; Linux x86_64; rv:124.0) Gecko/20100101 Firefox/124.0"
 API_BASE = "https://api.intra.42.fr"
+CDN_PDF  = "https://cdn.intra.42.fr/pdf/pdf/{id}/en.subject.pdf"
 CURSUS_ID = 21
 
 
@@ -194,9 +195,20 @@ def get_all_pages(path: str, token: str) -> list:
 
 
 def download_bytes(url: str, token: str) -> bytes:
-    req = Request(url, headers={"Authorization": f"Bearer {token}", "User-Agent": UA})
-    with urlopen(req) as resp:
-        return resp.read()
+    """Download a URL. Tries with Bearer auth first, then without (for public CDN URLs)."""
+    headers = {"User-Agent": UA}
+    for auth in (f"Bearer {token}", None):
+        hdrs = {**headers, "Authorization": auth} if auth else headers
+        req = Request(url, headers=hdrs)
+        try:
+            with urlopen(req) as resp:
+                return resp.read()
+        except HTTPError as e:
+            # On auth failure, retry without auth (CDN URLs are public)
+            if auth and e.code in (401, 403):
+                continue
+            raise
+    raise RuntimeError(f"download failed (auth and no-auth both failed): {url}")
 
 
 # ── PDF text extraction ───────────────────────────────────────────────────────
@@ -297,7 +309,7 @@ def find_subject_url(project_detail: dict) -> str | None:
     """
     Look for a PDF subject URL in the project detail.
     Checks: pdf field, attachments, project_sessions > uploads,
-    and project_sessions > subject.
+    project_sessions > subject, then falls back to the 42 CDN URL.
     """
     # Direct pdf field
     if project_detail.get("pdf"):
@@ -325,6 +337,12 @@ def find_subject_url(project_detail: dict) -> str | None:
                 return u
         elif isinstance(url, str) and url:
             return url
+
+    # CDN fallback — 42 stores many subject PDFs at a predictable CDN URL
+    # even when the API does not expose them in attachments / uploads.
+    project_id = project_detail.get("id")
+    if project_id:
+        return CDN_PDF.format(id=project_id)
 
     return None
 
@@ -434,23 +452,7 @@ def main():
         # Find subject PDF URL
         pdf_url = find_subject_url(detail)
         if not pdf_url:
-            # Print the keys available so we can find where the PDF actually is
-            top_keys = list(detail.keys())
-            session_keys = list((detail.get("project_sessions") or [{}])[0].keys()) if detail.get("project_sessions") else []
             print(f"    [skip] no subject PDF found", flush=True)
-            print(f"    [debug] top-level keys: {top_keys}", flush=True)
-            if session_keys:
-                print(f"    [debug] project_sessions[0] keys: {session_keys}", flush=True)
-            # Dump uploads and attachments raw so we can see the structure
-            for session in (detail.get("project_sessions") or [])[:1]:
-                print(f"    [debug] uploads     = {session.get('uploads')}", flush=True)
-            print(f"    [debug] attachments = {detail.get('attachments')}", flush=True)
-            print(f"    [debug] git_id      = {detail.get('git_id')}", flush=True)
-            print(f"    [debug] repository  = {detail.get('repository')}", flush=True)
-            print(f"    [debug] videos      = {detail.get('videos')}", flush=True)
-            # Print every session's campus_id so we know which session is ours
-            for idx, s in enumerate(detail.get("project_sessions") or []):
-                print(f"    [debug] session[{idx}] campus_id={s.get('campus_id')} uploads={s.get('uploads')}", flush=True)
             skipped += 1
             time.sleep(0.25)
             continue
@@ -460,6 +462,15 @@ def main():
         # Download PDF
         try:
             pdf_bytes = download_bytes(pdf_url, token)
+        except HTTPError as e:
+            if e.code == 404:
+                print(f"    [skip] PDF not found (404)", flush=True)
+                skipped += 1
+            else:
+                print(f"    [warn] download failed: HTTP {e.code}", flush=True)
+                errors += 1
+            time.sleep(0.25)
+            continue
         except Exception as e:
             print(f"    [warn] download failed: {e}", flush=True)
             errors += 1

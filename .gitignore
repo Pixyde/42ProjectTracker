@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+.env
+subjects/
+history.json
+.cache_summaries.json
+projects.json

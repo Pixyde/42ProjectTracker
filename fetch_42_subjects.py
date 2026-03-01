@@ -296,8 +296,8 @@ def save_cache(summaries, cache_file):
 def find_subject_url(project_detail: dict) -> str | None:
     """
     Look for a PDF subject URL in the project detail.
-    Checks: attachments, project_sessions > project_gitlab_path,
-    and the dedicated 'pdf' field some projects have.
+    Checks: pdf field, attachments, project_sessions > uploads,
+    and project_sessions > subject.
     """
     # Direct pdf field
     if project_detail.get("pdf"):
@@ -309,8 +309,15 @@ def find_subject_url(project_detail: dict) -> str | None:
         if url.lower().endswith(".pdf"):
             return url
 
-    # project_sessions may contain a subject url
+    # project_sessions may contain uploads or a subject url
     for session in (project_detail.get("project_sessions") or []):
+        # Check uploads array (where 42 API stores subject PDFs)
+        for upload in (session.get("uploads") or []):
+            u = upload.get("url") or upload.get("file_url") or upload.get("link") or ""
+            if u:
+                return u
+
+        # Fallback: check the subject field
         url = session.get("subject", {})
         if isinstance(url, dict):
             u = url.get("url") or url.get("file_url") or ""

@@ -41,10 +41,10 @@ from urllib.parse import urlencode, urlparse, parse_qs
 from urllib.request import urlopen, Request
 from urllib.error import HTTPError
 
-UA       = "Mozilla/5.0 (X11; Linux x86_64; rv:124.0) Gecko/20100101 Firefox/124.0"
-API_BASE = "https://api.intra.42.fr"
-CDN_PDF  = "https://cdn.intra.42.fr/pdf/pdf/{id}/en.subject.pdf"
-CURSUS_ID = 21
+UA            = "Mozilla/5.0 (X11; Linux x86_64; rv:124.0) Gecko/20100101 Firefox/124.0"
+API_BASE      = "https://api.intra.42.fr"
+PROJECTS_BASE = "https://projects.intra.42.fr"
+CURSUS_ID     = 21
 
 
 # ── .env loader ───────────────────────────────────────────────────────────────
@@ -307,9 +307,9 @@ def save_cache(summaries, cache_file):
 
 def find_subject_url(project_detail: dict) -> str | None:
     """
-    Look for a PDF subject URL in the project detail.
+    Look for a PDF subject URL in the project detail JSON.
     Checks: pdf field, attachments, project_sessions > uploads,
-    project_sessions > subject, then falls back to the 42 CDN URL.
+    and project_sessions > subject.
     """
     # Direct pdf field
     if project_detail.get("pdf"):
@@ -338,11 +338,50 @@ def find_subject_url(project_detail: dict) -> str | None:
         elif isinstance(url, str) and url:
             return url
 
-    # CDN fallback — 42 stores many subject PDFs at a predictable CDN URL
-    # even when the API does not expose them in attachments / uploads.
-    project_id = project_detail.get("id")
-    if project_id:
-        return CDN_PDF.format(id=project_id)
+    return None
+
+
+def scrape_subject_pdf_url(slug: str, token: str, session_cookie: str = None) -> str | None:
+    """
+    Discover the real CDN PDF URL by scraping the project page on
+    projects.intra.42.fr.  Tries bearer-token auth first, then falls
+    back to a session cookie if one was supplied.
+
+    The CDN stores PDFs at internal auto-incrementing IDs that do NOT
+    match the API project IDs, so the only reliable way to discover the
+    correct URL is to read it from the HTML of the project page.
+    """
+    for page_url in (
+        f"{PROJECTS_BASE}/projects/{slug}",
+        f"{PROJECTS_BASE}/{slug}",
+    ):
+        # Try bearer token first, then session cookie
+        auth_variants = []
+        auth_variants.append({
+            "Authorization": f"Bearer {token}",
+            "User-Agent": UA,
+        })
+        if session_cookie:
+            auth_variants.append({
+                "User-Agent": UA,
+                "Cookie": f"_intra_42_session_production={session_cookie}",
+            })
+
+        for headers in auth_variants:
+            req = Request(page_url, headers=headers)
+            try:
+                with urlopen(req) as resp:
+                    html = resp.read().decode("utf-8", errors="replace")
+            except Exception:
+                continue
+
+            # Look for CDN PDF URLs in the HTML
+            m = re.search(
+                r'https://cdn\.intra\.42\.fr/pdf/pdf/\d+/\w+\.subject\.pdf',
+                html,
+            )
+            if m:
+                return m.group(0)
 
     return None
 
@@ -382,6 +421,10 @@ def main():
                         help="Ignore cache and force a fresh fetch.")
     parser.add_argument("--dry-run",       action="store_true",
                         help="Authenticate and list projects but don't download anything")
+    parser.add_argument("--session-cookie", default=os.getenv("FT_SESSION_COOKIE"),
+                        help="Value of _intra_42_session_production cookie for "
+                             "projects.intra.42.fr scraping (optional). "
+                             "Needed when the API does not expose PDF URLs.")
     args = parser.parse_args()
 
     if not args.client_id or not args.client_secret:
@@ -449,8 +492,11 @@ def main():
             time.sleep(0.25)
             continue
 
-        # Find subject PDF URL
+        # Find subject PDF URL — try API fields first, then scrape the project page
         pdf_url = find_subject_url(detail)
+        if not pdf_url:
+            pdf_url = scrape_subject_pdf_url(slug, token, args.session_cookie)
+
         if not pdf_url:
             print(f"    [skip] no subject PDF found", flush=True)
             skipped += 1
@@ -542,6 +588,19 @@ def main():
     print(f"  History saved to {history_file}")
     print(f"  PDFs saved under {subjects_dir}/")
     print(f"  Open dashboard.html to explore the history.")
+
+    if skipped and not args.session_cookie:
+        print()
+        print("  ╭─ Tip ──────────────────────────────────────────────────────────╮")
+        print("  │ Some projects don't expose PDF URLs through the API.           │")
+        print("  │ To fix this, supply your 42 intra session cookie so the tool   │")
+        print("  │ can scrape the real CDN URLs from projects.intra.42.fr:        │")
+        print("  │                                                                │")
+        print("  │   1. Log into projects.intra.42.fr in your browser             │")
+        print("  │   2. Open DevTools → Application → Cookies                     │")
+        print("  │   3. Copy the value of _intra_42_session_production            │")
+        print("  │   4. Set FT_SESSION_COOKIE in .env or pass --session-cookie    │")
+        print("  ╰────────────────────────────────────────────────────────────────╯")
 
 
 if __name__ == "__main__":

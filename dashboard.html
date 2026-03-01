@@ -605,7 +605,7 @@ body::after {
         <div class="hero-empty">
           <div class="big">42</div>
           <div class="msg">
-            Run <code>python fetch_42_projects.py</code><br>
+            Run <code>python fetch_42.py</code><br>
             then load the generated <code>projects.json</code>
           </div>
         </div>
@@ -1029,10 +1029,14 @@ function buildHistoryStats() {
   const projects = Object.values(HISTORY.projects || {});
   const totalVersions = projects.reduce((s, p) => s + p.versions.length, 0);
   const withChanges   = projects.filter(p => p.versions.length > 1).length;
+  const totalMetaChanges = projects.reduce((s, p) => s + (p.project_changes || []).length, 0);
+  const withMetaChanges  = projects.filter(p => (p.project_changes || []).length > 1).length;
   document.getElementById('historyStatsRows').innerHTML = `
     <div class="stat-row"><span class="stat-label">Projects tracked</span><span class="stat-val acc">${projects.length}</span></div>
-    <div class="stat-row"><span class="stat-label">Total versions</span><span class="stat-val">${totalVersions}</span></div>
-    <div class="stat-row"><span class="stat-label">With changes</span><span class="stat-val">${withChanges}</span></div>
+    <div class="stat-row"><span class="stat-label">Subject versions</span><span class="stat-val">${totalVersions}</span></div>
+    <div class="stat-row"><span class="stat-label">Subject changes</span><span class="stat-val">${withChanges}</span></div>
+    <div class="stat-row"><span class="stat-label">Metadata snapshots</span><span class="stat-val">${totalMetaChanges}</span></div>
+    <div class="stat-row"><span class="stat-label">Metadata changes</span><span class="stat-val">${withMetaChanges}</span></div>
   `;
 }
 
@@ -1045,18 +1049,23 @@ function renderHistory() {
     return;
   }
 
-  // Sort: most recently changed first
+  // Sort: most recently changed first (by subject version or metadata change)
   projects.sort((a, b) => {
-    const aLast = a.versions[a.versions.length - 1]?.timestamp || '';
-    const bLast = b.versions[b.versions.length - 1]?.timestamp || '';
+    const aSubject = a.versions[a.versions.length - 1]?.timestamp || '';
+    const aMeta    = (a.project_changes || [])[a.project_changes?.length - 1]?.timestamp || '';
+    const aLast    = aSubject > aMeta ? aSubject : aMeta;
+    const bSubject = b.versions[b.versions.length - 1]?.timestamp || '';
+    const bMeta    = (b.project_changes || [])[b.project_changes?.length - 1]?.timestamp || '';
+    const bLast    = bSubject > bMeta ? bSubject : bMeta;
     return bLast.localeCompare(aLast);
   });
 
   let html = '';
 
-  // Section: projects with multiple versions (actual changes)
+  // Section: projects with multiple subject versions (actual changes)
   const changed = projects.filter(p => p.versions.length > 1);
   const stable  = projects.filter(p => p.versions.length === 1);
+  const metaOnly = projects.filter(p => p.versions.length === 0 && (p.project_changes || []).length > 0);
 
   if (changed.length) {
     html += `<div class="sec-head"><h2>Changed Subjects</h2><div class="line"></div></div>`;
@@ -1068,16 +1077,49 @@ function renderHistory() {
     html += stable.map(p => buildProjectDiff(p)).join('');
   }
 
+  if (metaOnly.length) {
+    html += `<div class="sec-head" style="margin-top:32px"><h2>Metadata Only (no subject PDF)</h2><div class="line"></div></div>`;
+    html += metaOnly.map(p => buildProjectDiff(p)).join('');
+  }
+
   document.getElementById('historyContent').innerHTML = html;
 }
 
 function buildProjectDiff(proj) {
   const versions  = proj.versions || [];
+  const metaChanges = proj.project_changes || [];
   const vCount    = versions.length;
+  const mCount    = metaChanges.length;
   const lastTs    = versions[vCount - 1]?.timestamp;
   const lastDate  = lastTs ? new Date(lastTs).toLocaleDateString('en-US', { month:'short', day:'numeric', year:'numeric' }) : '—';
-  const hasChange = vCount > 1;
+  const hasChange = vCount > 1 || mCount > 1;
 
+  // Project metadata change timeline
+  let metaHtml = '';
+  if (mCount > 0) {
+    const metaEntries = metaChanges.slice().reverse().map((m, i) => {
+      const isFirst = i === metaChanges.length - 1;
+      const ts = new Date(m.timestamp).toLocaleString('en-US', {
+        month:'short', day:'numeric', year:'numeric', hour:'2-digit', minute:'2-digit'
+      });
+      const updatedAt = m.updated_at ? new Date(m.updated_at).toLocaleString('en-US', {
+        month:'short', day:'numeric', year:'numeric', hour:'2-digit', minute:'2-digit'
+      }) : '—';
+      const badge = isFirst
+        ? `<span class="diff-stat" style="background:rgba(0,255,204,0.12);color:var(--accent)">FIRST SNAPSHOT</span>`
+        : `<span class="diff-stat" style="background:rgba(255,201,77,0.12);color:var(--yellow)">METADATA CHANGED</span>`;
+      return `<div class="diff-version">
+        <div class="diff-version-meta">
+          <span class="diff-ts">${ts}</span>
+          ${badge}
+        </div>
+        <div class="diff-body"><div class="diff-no-change">API updated_at: <code>${escHtml(updatedAt)}</code></div></div>
+      </div>`;
+    }).join('');
+    metaHtml = `<div style="margin:8px 0 4px 12px;font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:0.1em">Project Metadata (${mCount} snapshot${mCount !== 1 ? 's' : ''})</div>${metaEntries}`;
+  }
+
+  // Subject version timeline
   const versionsHtml = versions.slice().reverse().map((v, i) => {
     const isFirst   = i === versions.length - 1;  // reversed
     const ts        = new Date(v.timestamp).toLocaleString('en-US', {
@@ -1117,18 +1159,28 @@ function buildProjectDiff(proj) {
     </div>`;
   }).join('');
 
+  let subjectLabel = '';
+  if (vCount > 0) {
+    subjectLabel = `<div style="margin:12px 0 4px 12px;font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:0.1em">Subject PDFs (${vCount} version${vCount !== 1 ? 's' : ''})</div>`;
+  }
+
+  // Updated at line
+  const updatedAtStr = proj.project_updated_at
+    ? `<span style="color:var(--muted);font-size:11px;margin-left:8px">· API updated ${new Date(proj.project_updated_at).toLocaleDateString('en-US', {month:'short', day:'numeric', year:'numeric'})}</span>`
+    : '';
+
   return `<div class="diff-project${hasChange ? ' open' : ''}" id="proj-${escAttr(proj.slug)}">
     <div class="diff-project-header" onclick="toggleProject('${escAttr(proj.slug)}')">
       <div>
         <div class="diff-project-name">${escHtml(proj.name)}</div>
-        <div class="diff-project-slug">${escHtml(proj.slug)}</div>
+        <div class="diff-project-slug">${escHtml(proj.slug)}${updatedAtStr}</div>
       </div>
       <div style="display:flex;align-items:center;gap:10px">
-        <span class="diff-version-count">${vCount} version${vCount !== 1 ? 's' : ''} · last ${lastDate}</span>
+        <span class="diff-version-count">${vCount} version${vCount !== 1 ? 's' : ''} · ${mCount} snapshot${mCount !== 1 ? 's' : ''} · last ${lastDate}</span>
         <span class="diff-chevron">▼</span>
       </div>
     </div>
-    <div class="diff-versions">${versionsHtml}</div>
+    <div class="diff-versions">${metaHtml}${subjectLabel}${versionsHtml}</div>
   </div>`;
 }
 

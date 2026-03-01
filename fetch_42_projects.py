@@ -5,6 +5,9 @@ fetch_42_projects.py
 Fetches all projects from cursus 21 (42cursus / Python common core)
 and saves them to projects.json for use with dashboard.html.
 
+Uses the intra42 module (from timotif/intra_42) for API access:
+  - IntraAPI: OAuth2 client for the 42 API
+
 Setup:
     cp .env.example .env
     # Fill in FT_CLIENT_ID and FT_CLIENT_SECRET
@@ -22,12 +25,9 @@ import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from urllib.request import urlopen, Request
-from urllib.parse import urlencode
-from urllib.error import HTTPError
 
-UA        = "Mozilla/5.0 (X11; Linux x86_64; rv:124.0) Gecko/20100101 Firefox/124.0"
-API_BASE  = "https://api.intra.42.fr"
+from intra42 import IntraAPI
+
 CURSUS_ID = 21  # 42cursus — new Python common core
 
 
@@ -64,109 +64,6 @@ def load_dotenv(path: str = ".env") -> None:
 load_dotenv()
 
 
-# ── Auth ──────────────────────────────────────────────────────────────────────
-
-def get_token(client_id: str, client_secret: str) -> str:
-    client_id     = client_id.strip()
-    client_secret = client_secret.strip()
-
-    payload = urlencode({
-        "grant_type":    "client_credentials",
-        "client_id":     client_id,
-        "client_secret": client_secret,
-    }).encode()
-
-    req = Request(
-        f"{API_BASE}/oauth/token",
-        data=payload,
-        method="POST",
-        headers={
-            "Content-Type": "application/x-www-form-urlencoded",
-            "User-Agent":   UA,
-        },
-    )
-
-    try:
-        with urlopen(req) as resp:
-            return json.loads(resp.read())["access_token"]
-    except HTTPError as e:
-        body = ""
-        try:
-            body = e.read().decode("utf-8", errors="replace")
-        except Exception:
-            pass
-        print(f"\n  ✗ Authentication failed — HTTP {e.code} {e.reason}", flush=True)
-        if body:
-            print(f"  API response: {body}", flush=True)
-        print("\n  Checklist:", flush=True)
-        print("  1. https://profile.intra.42.fr/oauth/applications — grant type: Client Credentials", flush=True)
-        print(f"  2. FT_CLIENT_ID     = {client_id!r}", flush=True)
-        print(f"  3. FT_CLIENT_SECRET = {'*' * len(client_secret)} ({len(client_secret)} chars)", flush=True)
-        sys.exit(1)
-
-
-# ── HTTP helpers ──────────────────────────────────────────────────────────────
-
-def api_get(path: str, token: str, params: dict = None, retries: int = 5):
-    qs = ("?" + urlencode(params)) if params else ""
-    url = f"{API_BASE}{path}{qs}"
-    req = Request(url, headers={
-        "Authorization": f"Bearer {token}",
-        "User-Agent":    UA,
-    })
-    for attempt in range(retries):
-        try:
-            with urlopen(req) as resp:
-                return json.loads(resp.read())
-        except HTTPError as e:
-            if e.code == 429:
-                wait = 2 ** attempt
-                print(f"  [rate limit] waiting {wait}s…", flush=True)
-                time.sleep(wait)
-            else:
-                raise
-    raise RuntimeError(f"Failed after {retries} retries: {url}")
-
-
-def get_all_pages(path: str, token: str) -> list:
-    results = []
-    page = 1
-    per_page = 100
-    while True:
-        data = api_get(path, token, {"page[number]": page, "page[size]": per_page})
-        if not data:
-            break
-        results.extend(data)
-        print(f"  page {page}: +{len(data)} (total: {len(results)})", flush=True)
-        if len(data) < per_page:
-            break
-        page += 1
-        time.sleep(0.3)
-    return results
-
-
-
-# ── Project list cache ────────────────────────────────────────────────────────
-
-def load_cache(cache_file, max_age_hours):
-    if not cache_file.exists():
-        return None
-    age_hours = (time.time() - cache_file.stat().st_mtime) / 3600
-    if age_hours > max_age_hours:
-        print(f"  [cache] expired ({age_hours:.1f}h old, limit {max_age_hours}h)", flush=True)
-        return None
-    with open(cache_file, encoding="utf-8") as f:
-        data = json.load(f)
-    print(f"  [cache] hit — {len(data)} projects ({age_hours:.1f}h old)", flush=True)
-    return data
-
-
-def save_cache(summaries, cache_file):
-    cache_file.parent.mkdir(parents=True, exist_ok=True)
-    with open(cache_file, "w", encoding="utf-8") as f:
-        json.dump(summaries, f, ensure_ascii=False)
-    print(f"  [cache] saved {len(summaries)} projects → {cache_file}", flush=True)
-
 # ── Keyword filter ───────────────────────────────────────────────────────────
 
 def parse_keywords(raw: str) -> list[str]:
@@ -196,12 +93,6 @@ def main():
     parser.add_argument("--keywords",      default=os.getenv("FT_KEYWORDS", ""),
                         help="Comma-separated keywords to filter by name/slug. "
                              "Empty = no filter (fetch all). E.g. 'python,dslr'")
-    parser.add_argument("--cache-file", default=os.getenv("FT_CACHE_FILE", ".cache_summaries.json"),
-                        help="Cache file path (default: .cache_summaries.json)")
-    parser.add_argument("--cache-ttl",  type=float, default=float(os.getenv("FT_CACHE_TTL_HOURS", "24")),
-                        help="Cache TTL in hours (default: 24). Set 0 to always refresh.")
-    parser.add_argument("--no-cache",   action="store_true",
-                        help="Ignore cache and force a fresh fetch.")
     args = parser.parse_args()
 
     if not args.client_id or not args.client_secret:
@@ -211,27 +102,23 @@ def main():
         )
         sys.exit(1)
 
-    cache_file = Path(args.cache_file)
-
-    # 1. Try loading from cache first
-    summaries = None
-    if not args.no_cache and args.cache_ttl > 0:
-        print(f"\n→ Checking cache ({cache_file}) …", flush=True)
-        summaries = load_cache(cache_file, args.cache_ttl)
-
-    # 2. Auth (always needed — for detail fetches)
+    # 1. Auth via IntraAPI (automatic OAuth2 client credentials)
     print("\n→ Authenticating…", flush=True)
-    token = get_token(args.client_id, args.client_secret)
+    try:
+        api = IntraAPI(args.client_id, args.client_secret)
+    except Exception as e:
+        print(f"\n  ✗ Authentication failed: {e}", flush=True)
+        print("\n  Checklist:", flush=True)
+        print("  1. https://profile.intra.42.fr/oauth/applications — grant type: Client Credentials", flush=True)
+        print(f"  2. FT_CLIENT_ID     = {args.client_id!r}", flush=True)
+        print(f"  3. FT_CLIENT_SECRET = {'*' * len(args.client_secret)} ({len(args.client_secret)} chars)", flush=True)
+        sys.exit(1)
     print("  ✓ Token obtained", flush=True)
 
-    # 3. Fetch summaries from API if cache missed
-    if summaries is None:
-        print(f"\n→ Fetching projects from GET /v2/cursus/{CURSUS_ID}/projects …", flush=True)
-        summaries = get_all_pages(f"/v2/cursus/{CURSUS_ID}/projects", token)
-        print(f"  ✓ {len(summaries)} project(s) in cursus {CURSUS_ID}", flush=True)
-        save_cache(summaries, cache_file)
-    else:
-        print(f"  ✓ Using cached project list ({len(summaries)} projects)", flush=True)
+    # 2. Fetch project summaries from API
+    print(f"\n→ Fetching projects from GET /v2/cursus/{CURSUS_ID}/projects …", flush=True)
+    summaries = api.get_all_pages(f"/v2/cursus/{CURSUS_ID}/projects")
+    print(f"  ✓ {len(summaries)} project(s) in cursus {CURSUS_ID}", flush=True)
 
     # 3. Keyword filter on summary data (name + slug) — no extra API calls
     keywords = parse_keywords(args.keywords)
@@ -256,7 +143,7 @@ def main():
     projects = []
     for i, p in enumerate(targets, 1):
         try:
-            detail = api_get(f"/v2/projects/{p['id']}", token)
+            detail = api.get(f"/v2/projects/{p['id']}")
         except Exception as exc:
             print(f"  [warn] {p.get('slug', p['id'])} failed: {exc} — using summary", flush=True)
             detail = p
@@ -285,10 +172,10 @@ def main():
 
         time.sleep(0.25)
 
-    # 4. Sort by most recently updated
+    # 5. Sort by most recently updated
     projects.sort(key=lambda p: p.get("updated_at") or "", reverse=True)
 
-    # 5. Write output
+    # 6. Write output
     output = {
         "fetched_at": datetime.now(timezone.utc).isoformat(),
         "cursus_id":  CURSUS_ID,

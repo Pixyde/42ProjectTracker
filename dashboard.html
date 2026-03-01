@@ -357,7 +357,7 @@ body::after {
   padding: 8px 12px;
   min-width: 160px;
   max-width: 240px;
-  cursor: default;
+  cursor: pointer;
   transition: border-color 0.15s, transform 0.15s;
 }
 .proj-chip:hover { border-color: rgba(0,255,204,0.4); transform: translateY(-1px); }
@@ -390,6 +390,7 @@ body::after {
   font-size: 12px;
 }
 .proj-table tr:hover td { background: rgba(255,255,255,0.02); }
+.proj-table tbody tr { cursor: pointer; }
 
 .badge {
   display: inline-block;
@@ -481,6 +482,7 @@ body::after {
 }
 .diff-chevron { color: var(--muted); font-size: 10px; transition: transform 0.2s; flex-shrink: 0; }
 .diff-project.open .diff-chevron { transform: rotate(180deg); }
+.diff-project.highlighted { outline: 1px solid var(--accent); transition: outline 0.3s; }
 
 .diff-versions { display: none; border-top: 1px solid var(--border); }
 .diff-project.open .diff-versions { display: block; }
@@ -547,7 +549,7 @@ body::after {
 <div class="shell">
   <header class="topbar">
     <div class="logo">42 CORE <span>// PYTHON TRACKER</span></div>
-    <div class="topbar-meta" id="topMeta">Load a <strong>projects.json</strong> to begin</div>
+    <div class="topbar-meta" id="topMeta">Loading <strong>data.json</strong>…</div>
   </header>
 
   <div class="main">
@@ -559,7 +561,7 @@ body::after {
         <label class="upload-zone" id="uploadZone">
           <input type="file" id="fileInput" accept=".json">
           <div class="upload-icon">⬡</div>
-          <div class="upload-text">Drop <strong>projects.json</strong><br>or click to browse</div>
+          <div class="upload-text">Drop <strong>data.json</strong><br>or click to browse</div>
         </label>
       </div>
 
@@ -576,15 +578,6 @@ body::after {
       <div class="sidebar-section" id="searchSection" style="display:none">
         <div class="sidebar-label">Search</div>
         <input class="search-box" id="searchBox" type="text" placeholder="project name or slug…">
-      </div>
-
-      <div class="sidebar-section">
-        <div class="sidebar-label">Subject History</div>
-        <label class="upload-zone" id="historyUploadZone">
-          <input type="file" id="historyFileInput" accept=".json">
-          <div class="upload-icon">◈</div>
-          <div class="upload-text">Drop <strong>history.json</strong><br>or click to browse</div>
-        </label>
       </div>
 
       <div class="sidebar-section" id="historyStatsSection" style="display:none">
@@ -605,8 +598,8 @@ body::after {
         <div class="hero-empty">
           <div class="big">42</div>
           <div class="msg">
-            Run <code>python fetch_42_projects.py</code><br>
-            then load the generated <code>projects.json</code>
+            Run <code>python fetch_42.py</code><br>
+            then open this dashboard
           </div>
         </div>
       </main>
@@ -614,7 +607,7 @@ body::after {
       <main class="content" id="historyContent" style="display:none">
         <div class="diff-empty">
           <div class="big">◈</div>
-          <div>Load <code>history.json</code> from the sidebar<br>to view subject diff history</div>
+          <div>No history data available yet.<br>Run <code>python fetch_42.py</code> to generate data.</div>
         </div>
       </main>
     </div>
@@ -626,6 +619,7 @@ body::after {
 <script>
 // ── State ─────────────────────────────────────────────────────────────────────
 let DB = null;
+let HISTORY = null;
 let activeFilter = 'all';
 let searchQuery = '';
 
@@ -643,23 +637,49 @@ uploadZone.addEventListener('drop', e => {
   if (e.dataTransfer.files[0]) loadFile(e.dataTransfer.files[0]);
 });
 
+function loadFromData(data) {
+  // Accept combined {projects: [...], history: {...}} or bare array
+  DB = Array.isArray(data) ? data : (data.projects || []);
+  DB._meta = Array.isArray(data) ? {} : { fetched_at: data.fetched_at };
+  // Extract history if present
+  if (data.history && data.history.projects) {
+    HISTORY = data.history;
+    // Use subject version timestamps for activity tracking
+    // Fall back to API updated_at for projects without subject versions yet
+    for (const p of DB) {
+      const hist = HISTORY.projects[p.slug];
+      if (hist && hist.versions && hist.versions.length > 0) {
+        p.updated_at = hist.versions[hist.versions.length - 1].timestamp;
+      }
+    }
+  }
+  initAll();
+}
+
 function loadFile(file) {
   if (!file) return;
   const reader = new FileReader();
   reader.onload = ev => {
     try {
-      const data = JSON.parse(ev.target.result);
-      // Accept both {projects: [...]} envelope and bare array
-      DB = Array.isArray(data) ? data : (data.projects || []);
-      // Attach meta
-      DB._meta = Array.isArray(data) ? {} : { fetched_at: data.fetched_at, python_only: data.python_only };
-      init();
+      loadFromData(JSON.parse(ev.target.result));
     } catch (err) {
       alert('Invalid JSON file: ' + err.message);
     }
   };
   reader.readAsText(file);
 }
+
+// ── Auto-load data.json on page load ─────────────────────────────────────────
+fetch('data.json')
+  .then(resp => {
+    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+    return resp.json();
+  })
+  .then(data => loadFromData(data))
+  .catch(() => {
+    document.getElementById('topMeta').innerHTML =
+      'Load a <strong>data.json</strong> file or run <code>python fetch_42.py</code>';
+  });
 
 // ── Init ──────────────────────────────────────────────────────────────────────
 const now = new Date();
@@ -675,7 +695,8 @@ function ageCategory(dateStr) {
   return 'old';
 }
 
-function init() {
+function initAll() {
+  // Init projects view
   buildTopMeta();
   buildStats();
   buildFilters();
@@ -685,8 +706,17 @@ function init() {
   document.getElementById('searchBox').addEventListener('input', e => {
     searchQuery = e.target.value.toLowerCase();
     render();
+    if (HISTORY) renderHistory();
   });
   render();
+  showTabBar();
+
+  // Init history view if present
+  if (HISTORY) {
+    buildHistoryStats();
+    renderHistory();
+    document.getElementById('historyStatsSection').style.display = 'block';
+  }
 }
 
 function buildTopMeta() {
@@ -896,7 +926,7 @@ function buildTimeline(projects) {
     if (projs.length) {
       for (const p of projs) {
         const time = new Date(p.updated_at).toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' });
-        html += `<div class="proj-chip">
+        html += `<div class="proj-chip" onclick="navigateToProject('${escAttr(p.slug)}')">
           <div class="chip-name" title="${escAttr(p.name)}">${escHtml(p.name)}</div>
           <div class="chip-slug">${escHtml(p.slug)}</div>
           <div class="chip-time">${time}</div>
@@ -927,7 +957,7 @@ function buildTable(projects) {
       year: 'numeric', month: 'short', day: 'numeric',
       hour: '2-digit', minute: '2-digit'
     }) : '—';
-    return `<tr>
+    return `<tr onclick="navigateToProject('${escAttr(p.slug)}')">
       <td style="color:var(--text);font-weight:500">${escHtml(p.name)}</td>
       <td style="color:var(--muted)">${escHtml(p.slug)}</td>
       <td>${date}</td>
@@ -983,69 +1013,60 @@ function switchTab(tab) {
   document.getElementById('tabHistory').classList.toggle('active',  tab === 'history');
 }
 
+function navigateToProject(slug) {
+  if (!HISTORY) return;
+  switchTab('history');
+  setTimeout(() => {
+    const el = document.getElementById(`proj-${slug}`);
+    if (el) {
+      el.classList.add('open');
+      el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+      el.classList.add('highlighted');
+      setTimeout(() => { el.classList.remove('highlighted'); }, 2000);
+    }
+  }, 50);
+}
+
 // Show tab bar once any data is loaded
 function showTabBar() {
   document.getElementById('tabBar').style.display = 'flex';
 }
 
-// ── History file loading ──────────────────────────────────────────────────────
-let HISTORY = null;
-
-const historyFileInput  = document.getElementById('historyFileInput');
-const historyUploadZone = document.getElementById('historyUploadZone');
-
-historyFileInput.addEventListener('change', e => loadHistoryFile(e.target.files[0]));
-historyUploadZone.addEventListener('dragover',  e => { e.preventDefault(); historyUploadZone.classList.add('drag'); });
-historyUploadZone.addEventListener('dragleave', () => historyUploadZone.classList.remove('drag'));
-historyUploadZone.addEventListener('drop', e => {
-  e.preventDefault();
-  historyUploadZone.classList.remove('drag');
-  if (e.dataTransfer.files[0]) loadHistoryFile(e.dataTransfer.files[0]);
-});
-
-function loadHistoryFile(file) {
-  if (!file) return;
-  const reader = new FileReader();
-  reader.onload = ev => {
-    try {
-      HISTORY = JSON.parse(ev.target.result);
-      initHistory();
-    } catch (err) {
-      alert('Invalid history.json: ' + err.message);
-    }
-  };
-  reader.readAsText(file);
-}
-
-function initHistory() {
-  showTabBar();
-  buildHistoryStats();
-  renderHistory();
-  document.getElementById('historyStatsSection').style.display = 'block';
-  switchTab('history');
-}
-
+// ── History stats & rendering ─────────────────────────────────────────────────
 function buildHistoryStats() {
   const projects = Object.values(HISTORY.projects || {});
   const totalVersions = projects.reduce((s, p) => s + p.versions.length, 0);
   const withChanges   = projects.filter(p => p.versions.length > 1).length;
   document.getElementById('historyStatsRows').innerHTML = `
     <div class="stat-row"><span class="stat-label">Projects tracked</span><span class="stat-val acc">${projects.length}</span></div>
-    <div class="stat-row"><span class="stat-label">Total versions</span><span class="stat-val">${totalVersions}</span></div>
-    <div class="stat-row"><span class="stat-label">With changes</span><span class="stat-val">${withChanges}</span></div>
+    <div class="stat-row"><span class="stat-label">Subject versions</span><span class="stat-val">${totalVersions}</span></div>
+    <div class="stat-row"><span class="stat-label">Subject changes</span><span class="stat-val">${withChanges}</span></div>
   `;
 }
 
 // ── History rendering ─────────────────────────────────────────────────────────
 function renderHistory() {
-  const projects = Object.values(HISTORY.projects || {});
+  let projects = Object.values(HISTORY.projects || {});
   if (!projects.length) {
     document.getElementById('historyContent').innerHTML = `
       <div class="diff-empty"><div class="big">◈</div><div>No project history found in this file.</div></div>`;
     return;
   }
 
-  // Sort: most recently changed first
+  // Apply search filter
+  if (searchQuery) {
+    projects = projects.filter(p => {
+      const h = ((p.name || '') + ' ' + (p.slug || '')).toLowerCase();
+      return h.includes(searchQuery);
+    });
+    if (!projects.length) {
+      document.getElementById('historyContent').innerHTML = `
+        <div class="diff-empty"><div class="big">◈</div><div>No projects match your search.</div></div>`;
+      return;
+    }
+  }
+
+  // Sort: most recently changed first (by subject version timestamp)
   projects.sort((a, b) => {
     const aLast = a.versions[a.versions.length - 1]?.timestamp || '';
     const bLast = b.versions[b.versions.length - 1]?.timestamp || '';
@@ -1054,9 +1075,10 @@ function renderHistory() {
 
   let html = '';
 
-  // Section: projects with multiple versions (actual changes)
+  // Section: projects with multiple subject versions (actual changes)
   const changed = projects.filter(p => p.versions.length > 1);
   const stable  = projects.filter(p => p.versions.length === 1);
+  const untracked = projects.filter(p => p.versions.length === 0);
 
   if (changed.length) {
     html += `<div class="sec-head"><h2>Changed Subjects</h2><div class="line"></div></div>`;
@@ -1066,6 +1088,11 @@ function renderHistory() {
   if (stable.length) {
     html += `<div class="sec-head" style="margin-top:32px"><h2>Stable Subjects</h2><div class="line"></div></div>`;
     html += stable.map(p => buildProjectDiff(p)).join('');
+  }
+
+  if (untracked.length) {
+    html += `<div class="sec-head" style="margin-top:32px"><h2>Not Yet Tracked</h2><div class="line"></div></div>`;
+    html += untracked.map(p => buildProjectDiff(p)).join('');
   }
 
   document.getElementById('historyContent').innerHTML = html;
@@ -1078,6 +1105,7 @@ function buildProjectDiff(proj) {
   const lastDate  = lastTs ? new Date(lastTs).toLocaleDateString('en-US', { month:'short', day:'numeric', year:'numeric' }) : '—';
   const hasChange = vCount > 1;
 
+  // Subject version timeline
   const versionsHtml = versions.slice().reverse().map((v, i) => {
     const isFirst   = i === versions.length - 1;  // reversed
     const ts        = new Date(v.timestamp).toLocaleString('en-US', {
@@ -1093,9 +1121,6 @@ function buildProjectDiff(proj) {
       if (!v.words_added && !v.words_removed) statBadges = `<span class="diff-stat" style="background:rgba(74,82,112,0.3);color:var(--muted)">no text change</span>`;
     }
 
-    // Render diff chunks if available (loaded from diff_file — requires pre-loading)
-    // Since we can't fetch local files from HTML, we show a summary instead
-    // and offer copy of the diff_file path
     let diffBody = '';
     if (v._chunks) {
       diffBody = renderDiffChunks(v._chunks);
@@ -1117,11 +1142,16 @@ function buildProjectDiff(proj) {
     </div>`;
   }).join('');
 
+  // Baseline date from initial API setup
+  const baselineStr = proj.project_updated_at
+    ? `<span style="color:var(--muted);font-size:11px;margin-left:8px">· baseline ${new Date(proj.project_updated_at).toLocaleDateString('en-US', {month:'short', day:'numeric', year:'numeric'})}</span>`
+    : '';
+
   return `<div class="diff-project${hasChange ? ' open' : ''}" id="proj-${escAttr(proj.slug)}">
     <div class="diff-project-header" onclick="toggleProject('${escAttr(proj.slug)}')">
       <div>
         <div class="diff-project-name">${escHtml(proj.name)}</div>
-        <div class="diff-project-slug">${escHtml(proj.slug)}</div>
+        <div class="diff-project-slug">${escHtml(proj.slug)}${baselineStr}</div>
       </div>
       <div style="display:flex;align-items:center;gap:10px">
         <span class="diff-version-count">${vCount} version${vCount !== 1 ? 's' : ''} · last ${lastDate}</span>
@@ -1172,16 +1202,6 @@ function loadDiffFile(file, slug, timestamp) {
   reader.readAsText(file);
 }
 
-// Patch init() to show tab bar when projects.json loads
-const _origInit = typeof init === 'function' ? init : null;
-
-
-// Show tab bar when projects load too
-const _origBuildTopMeta = buildTopMeta;
-function buildTopMeta() {
-  _origBuildTopMeta();
-  showTabBar();
-}
 </script>
 </body>
 </html>

@@ -357,7 +357,7 @@ body::after {
   padding: 8px 12px;
   min-width: 160px;
   max-width: 240px;
-  cursor: default;
+  cursor: pointer;
   transition: border-color 0.15s, transform 0.15s;
 }
 .proj-chip:hover { border-color: rgba(0,255,204,0.4); transform: translateY(-1px); }
@@ -390,6 +390,7 @@ body::after {
   font-size: 12px;
 }
 .proj-table tr:hover td { background: rgba(255,255,255,0.02); }
+.proj-table tbody tr { cursor: pointer; }
 
 .badge {
   display: inline-block;
@@ -481,6 +482,7 @@ body::after {
 }
 .diff-chevron { color: var(--muted); font-size: 10px; transition: transform 0.2s; flex-shrink: 0; }
 .diff-project.open .diff-chevron { transform: rotate(180deg); }
+.diff-project.highlighted { outline: 1px solid var(--accent); transition: outline 0.3s; }
 
 .diff-versions { display: none; border-top: 1px solid var(--border); }
 .diff-project.open .diff-versions { display: block; }
@@ -704,6 +706,7 @@ function initAll() {
   document.getElementById('searchBox').addEventListener('input', e => {
     searchQuery = e.target.value.toLowerCase();
     render();
+    if (HISTORY) renderHistory();
   });
   render();
   showTabBar();
@@ -923,7 +926,7 @@ function buildTimeline(projects) {
     if (projs.length) {
       for (const p of projs) {
         const time = new Date(p.updated_at).toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' });
-        html += `<div class="proj-chip">
+        html += `<div class="proj-chip" onclick="navigateToProject('${escAttr(p.slug)}')">
           <div class="chip-name" title="${escAttr(p.name)}">${escHtml(p.name)}</div>
           <div class="chip-slug">${escHtml(p.slug)}</div>
           <div class="chip-time">${time}</div>
@@ -954,7 +957,7 @@ function buildTable(projects) {
       year: 'numeric', month: 'short', day: 'numeric',
       hour: '2-digit', minute: '2-digit'
     }) : '—';
-    return `<tr>
+    return `<tr onclick="navigateToProject('${escAttr(p.slug)}')">
       <td style="color:var(--text);font-weight:500">${escHtml(p.name)}</td>
       <td style="color:var(--muted)">${escHtml(p.slug)}</td>
       <td>${date}</td>
@@ -1010,6 +1013,20 @@ function switchTab(tab) {
   document.getElementById('tabHistory').classList.toggle('active',  tab === 'history');
 }
 
+function navigateToProject(slug) {
+  if (!HISTORY) return;
+  switchTab('history');
+  setTimeout(() => {
+    const el = document.getElementById(`proj-${slug}`);
+    if (el) {
+      el.classList.add('open');
+      el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+      el.classList.add('highlighted');
+      setTimeout(() => { el.classList.remove('highlighted'); }, 2000);
+    }
+  }, 50);
+}
+
 // Show tab bar once any data is loaded
 function showTabBar() {
   document.getElementById('tabBar').style.display = 'flex';
@@ -1029,11 +1046,24 @@ function buildHistoryStats() {
 
 // ── History rendering ─────────────────────────────────────────────────────────
 function renderHistory() {
-  const projects = Object.values(HISTORY.projects || {});
+  let projects = Object.values(HISTORY.projects || {});
   if (!projects.length) {
     document.getElementById('historyContent').innerHTML = `
       <div class="diff-empty"><div class="big">◈</div><div>No project history found in this file.</div></div>`;
     return;
+  }
+
+  // Apply search filter
+  if (searchQuery) {
+    projects = projects.filter(p => {
+      const h = ((p.name || '') + ' ' + (p.slug || '')).toLowerCase();
+      return h.includes(searchQuery);
+    });
+    if (!projects.length) {
+      document.getElementById('historyContent').innerHTML = `
+        <div class="diff-empty"><div class="big">◈</div><div>No projects match your search.</div></div>`;
+      return;
+    }
   }
 
   // Sort: most recently changed first (by subject version timestamp)

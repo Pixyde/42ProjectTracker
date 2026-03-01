@@ -166,8 +166,12 @@ def load_data(data_file: Path) -> dict:
     """Load the combined data file (projects + history)."""
     if data_file.exists():
         with open(data_file, encoding="utf-8") as f:
-            return json.load(f)
-    return {}
+            data = json.load(f)
+            # Ensure history structure exists
+            data.setdefault("history", {"projects": {}})
+            data["history"].setdefault("projects", {})
+            return data
+    return {"history": {"projects": {}}}
 
 
 def save_data(data: dict, data_file: Path) -> None:
@@ -233,7 +237,7 @@ def main():
 
     # Load existing combined data (for history continuity)
     existing = load_data(data_file)
-    history = existing.get("history", {"projects": {}})
+    history = existing["history"]
 
     # ── Phase 1: API — project metadata ──────────────────────────────────────
 

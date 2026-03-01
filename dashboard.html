@@ -547,7 +547,7 @@ body::after {
 <div class="shell">
   <header class="topbar">
     <div class="logo">42 CORE <span>// PYTHON TRACKER</span></div>
-    <div class="topbar-meta" id="topMeta">Load a <strong>projects.json</strong> to begin</div>
+    <div class="topbar-meta" id="topMeta">Loading <strong>data.json</strong>…</div>
   </header>
 
   <div class="main">
@@ -559,7 +559,7 @@ body::after {
         <label class="upload-zone" id="uploadZone">
           <input type="file" id="fileInput" accept=".json">
           <div class="upload-icon">⬡</div>
-          <div class="upload-text">Drop <strong>projects.json</strong><br>or click to browse</div>
+          <div class="upload-text">Drop <strong>data.json</strong><br>or click to browse</div>
         </label>
       </div>
 
@@ -576,15 +576,6 @@ body::after {
       <div class="sidebar-section" id="searchSection" style="display:none">
         <div class="sidebar-label">Search</div>
         <input class="search-box" id="searchBox" type="text" placeholder="project name or slug…">
-      </div>
-
-      <div class="sidebar-section">
-        <div class="sidebar-label">Subject History</div>
-        <label class="upload-zone" id="historyUploadZone">
-          <input type="file" id="historyFileInput" accept=".json">
-          <div class="upload-icon">◈</div>
-          <div class="upload-text">Drop <strong>history.json</strong><br>or click to browse</div>
-        </label>
       </div>
 
       <div class="sidebar-section" id="historyStatsSection" style="display:none">
@@ -606,7 +597,7 @@ body::after {
           <div class="big">42</div>
           <div class="msg">
             Run <code>python fetch_42.py</code><br>
-            then load the generated <code>projects.json</code>
+            then open this dashboard
           </div>
         </div>
       </main>
@@ -614,7 +605,7 @@ body::after {
       <main class="content" id="historyContent" style="display:none">
         <div class="diff-empty">
           <div class="big">◈</div>
-          <div>Load <code>history.json</code> from the sidebar<br>to view subject diff history</div>
+          <div>No history data available yet.<br>Run <code>python fetch_42.py</code> to generate data.</div>
         </div>
       </main>
     </div>
@@ -626,6 +617,7 @@ body::after {
 <script>
 // ── State ─────────────────────────────────────────────────────────────────────
 let DB = null;
+let HISTORY = null;
 let activeFilter = 'all';
 let searchQuery = '';
 
@@ -643,23 +635,41 @@ uploadZone.addEventListener('drop', e => {
   if (e.dataTransfer.files[0]) loadFile(e.dataTransfer.files[0]);
 });
 
+function loadFromData(data) {
+  // Accept combined {projects: [...], history: {...}} or bare array
+  DB = Array.isArray(data) ? data : (data.projects || []);
+  DB._meta = Array.isArray(data) ? {} : { fetched_at: data.fetched_at };
+  // Extract history if present
+  if (data.history && data.history.projects) {
+    HISTORY = data.history;
+  }
+  initAll();
+}
+
 function loadFile(file) {
   if (!file) return;
   const reader = new FileReader();
   reader.onload = ev => {
     try {
-      const data = JSON.parse(ev.target.result);
-      // Accept both {projects: [...]} envelope and bare array
-      DB = Array.isArray(data) ? data : (data.projects || []);
-      // Attach meta
-      DB._meta = Array.isArray(data) ? {} : { fetched_at: data.fetched_at, python_only: data.python_only };
-      init();
+      loadFromData(JSON.parse(ev.target.result));
     } catch (err) {
       alert('Invalid JSON file: ' + err.message);
     }
   };
   reader.readAsText(file);
 }
+
+// ── Auto-load data.json on page load ─────────────────────────────────────────
+fetch('data.json')
+  .then(resp => {
+    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+    return resp.json();
+  })
+  .then(data => loadFromData(data))
+  .catch(() => {
+    document.getElementById('topMeta').innerHTML =
+      'Load a <strong>data.json</strong> file or run <code>python fetch_42.py</code>';
+  });
 
 // ── Init ──────────────────────────────────────────────────────────────────────
 const now = new Date();
@@ -675,7 +685,8 @@ function ageCategory(dateStr) {
   return 'old';
 }
 
-function init() {
+function initAll() {
+  // Init projects view
   buildTopMeta();
   buildStats();
   buildFilters();
@@ -687,6 +698,14 @@ function init() {
     render();
   });
   render();
+  showTabBar();
+
+  // Init history view if present
+  if (HISTORY) {
+    buildHistoryStats();
+    renderHistory();
+    document.getElementById('historyStatsSection').style.display = 'block';
+  }
 }
 
 function buildTopMeta() {
@@ -988,43 +1007,7 @@ function showTabBar() {
   document.getElementById('tabBar').style.display = 'flex';
 }
 
-// ── History file loading ──────────────────────────────────────────────────────
-let HISTORY = null;
-
-const historyFileInput  = document.getElementById('historyFileInput');
-const historyUploadZone = document.getElementById('historyUploadZone');
-
-historyFileInput.addEventListener('change', e => loadHistoryFile(e.target.files[0]));
-historyUploadZone.addEventListener('dragover',  e => { e.preventDefault(); historyUploadZone.classList.add('drag'); });
-historyUploadZone.addEventListener('dragleave', () => historyUploadZone.classList.remove('drag'));
-historyUploadZone.addEventListener('drop', e => {
-  e.preventDefault();
-  historyUploadZone.classList.remove('drag');
-  if (e.dataTransfer.files[0]) loadHistoryFile(e.dataTransfer.files[0]);
-});
-
-function loadHistoryFile(file) {
-  if (!file) return;
-  const reader = new FileReader();
-  reader.onload = ev => {
-    try {
-      HISTORY = JSON.parse(ev.target.result);
-      initHistory();
-    } catch (err) {
-      alert('Invalid history.json: ' + err.message);
-    }
-  };
-  reader.readAsText(file);
-}
-
-function initHistory() {
-  showTabBar();
-  buildHistoryStats();
-  renderHistory();
-  document.getElementById('historyStatsSection').style.display = 'block';
-  switchTab('history');
-}
-
+// ── History stats & rendering ─────────────────────────────────────────────────
 function buildHistoryStats() {
   const projects = Object.values(HISTORY.projects || {});
   const totalVersions = projects.reduce((s, p) => s + p.versions.length, 0);
@@ -1224,16 +1207,6 @@ function loadDiffFile(file, slug, timestamp) {
   reader.readAsText(file);
 }
 
-// Patch init() to show tab bar when projects.json loads
-const _origInit = typeof init === 'function' ? init : null;
-
-
-// Show tab bar when projects load too
-const _origBuildTopMeta = buildTopMeta;
-function buildTopMeta() {
-  _origBuildTopMeta();
-  showTabBar();
-}
 </script>
 </body>
 </html>

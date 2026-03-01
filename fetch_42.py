@@ -3,15 +3,19 @@
 fetch_42.py
 -----------
 Combined fetcher for 42 project metadata and subject PDFs.
+Outputs a single data.json used directly by dashboard.html.
 
 Phase 1 — Project metadata (via IntraAPI):
-  Fetches all projects from cursus 21, saves to projects.json.
-  Tracks project metadata changes (updated_at) in history.json.
+  Fetches all projects from cursus 21.
+  Tracks project metadata changes (updated_at).
 
 Phase 2 — Subject PDFs (via IntraScrape):
   Scrapes projects.intra.42.fr for subject attachments.
-  Downloads PDFs, extracts text, tracks word-level diffs in history.json.
+  Downloads PDFs, extracts text, tracks word-level diffs.
   (Skipped automatically if SESSION_COOKIE is not set.)
+
+Both phases write to a single output file (default: data.json)
+that the dashboard auto-loads.
 
 Dependencies:
     pip install -r requirements.txt
@@ -156,18 +160,20 @@ def matches_keywords_scrape(project: dict, keywords: list[str]) -> bool:
     return any(kw in haystack for kw in keywords)
 
 
-# ── History management ────────────────────────────────────────────────────────
+# ── Data file management ──────────────────────────────────────────────────────
 
-def load_history(history_file: Path) -> dict:
-    if history_file.exists():
-        with open(history_file, encoding="utf-8") as f:
+def load_data(data_file: Path) -> dict:
+    """Load the combined data file (projects + history)."""
+    if data_file.exists():
+        with open(data_file, encoding="utf-8") as f:
             return json.load(f)
-    return {"projects": {}}
+    return {}
 
 
-def save_history(history: dict, history_file: Path) -> None:
-    with open(history_file, "w", encoding="utf-8") as f:
-        json.dump(history, f, indent=2, ensure_ascii=False)
+def save_data(data: dict, data_file: Path) -> None:
+    """Save the combined data file (projects + history)."""
+    with open(data_file, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
 
 
 # ── Project metadata hash ────────────────────────────────────────────────────
@@ -201,8 +207,8 @@ def main():
     parser.add_argument("--user-id-cookie",      default=os.getenv("USER_ID_COOKIE"))
     parser.add_argument("--cf-clearance-cookie",  default=os.getenv("CF_CLEARANCE_COOKIE"))
     # Output
-    parser.add_argument("--output",        default=os.getenv("OUTPUT_FILE", "projects.json"))
-    parser.add_argument("--history-file",  default=os.getenv("FT_HISTORY_FILE", "history.json"))
+    parser.add_argument("--output",        default=os.getenv("OUTPUT_FILE", "data.json"),
+                        help="Combined output file (projects + history, default: data.json)")
     parser.add_argument("--subjects-dir",  default=os.getenv("FT_SUBJECTS_DIR", "subjects"))
     # Filters
     parser.add_argument("--keywords",      default=os.getenv("FT_KEYWORDS", ""),
@@ -221,9 +227,13 @@ def main():
         sys.exit(1)
 
     subjects_dir = Path(args.subjects_dir)
-    history_file = Path(args.history_file)
+    data_file = Path(args.output)
     subjects_dir.mkdir(parents=True, exist_ok=True)
     run_ts = datetime.now(timezone.utc).isoformat()
+
+    # Load existing combined data (for history continuity)
+    existing = load_data(data_file)
+    history = existing.get("history", {"projects": {}})
 
     # ── Phase 1: API — project metadata ──────────────────────────────────────
 
@@ -308,7 +318,6 @@ def main():
     # ── Track project metadata changes in history ────────────────────────────
 
     print(f"\n→ Tracking project metadata changes …", flush=True)
-    history = load_history(history_file)
     meta_changes = 0
 
     for proj in projects:
@@ -348,19 +357,17 @@ def main():
             meta_changes += 1
 
     print(f"  ✓ {meta_changes} project(s) with metadata changes detected", flush=True)
-    save_history(history, history_file)
 
-    # Write projects.json
+    # Write combined data file (projects + history)
     output = {
         "fetched_at": run_ts,
         "cursus_id":  CURSUS_ID,
         "total":      len(projects),
         "projects":   projects,
+        "history":    history,
     }
-
-    with open(args.output, "w", encoding="utf-8") as f:
-        json.dump(output, f, indent=2, ensure_ascii=False)
-    print(f"\n  ✓ Saved {len(projects)} projects → {args.output}", flush=True)
+    save_data(output, data_file)
+    print(f"\n  ✓ Saved {len(projects)} projects → {data_file}", flush=True)
 
     # ── Phase 2: Subject PDFs (scraping) ─────────────────────────────────────
 
@@ -490,18 +497,19 @@ def main():
                 })
 
                 changed += 1
-                save_history(history, history_file)
+                output["history"] = history
+                save_data(output, data_file)
                 time.sleep(0.5)
 
             print(f"\n  ✓ Subjects — {changed} changed, {skipped} no PDF, {errors} errors", flush=True)
 
     # Final save
-    save_history(history, history_file)
+    output["history"] = history
+    save_data(output, data_file)
 
     print(f"\n{'═' * 50}")
     print(f"✓ All done")
-    print(f"  Projects  → {args.output}")
-    print(f"  History   → {history_file}")
+    print(f"  Data      → {data_file}")
     print(f"  Subjects  → {subjects_dir}/")
     print(f"  Dashboard → open dashboard.html")
 

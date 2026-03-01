@@ -2,32 +2,30 @@
 """
 fetch_42.py
 -----------
-Combined fetcher for 42 project metadata and subject PDFs.
+Fetcher for 42 project subject PDFs with change tracking.
 Outputs a single data.json used directly by dashboard.html.
 
-Phase 1 — Project metadata (via IntraAPI):
-  Fetches all projects from cursus 21.
-  Tracks project metadata changes (updated_at).
+First-time setup (automatic):
+  Uses the 42 API to fetch the initial project list from cursus 21.
+  Stores project metadata (name, slug, updated_at) as a baseline.
+  Only runs once — skipped automatically when data.json already exists.
 
-Phase 2 — Subject PDFs (via IntraScrape):
-  Scrapes projects.intra.42.fr for subject attachments.
+Subject tracking (every run):
+  Scrapes projects.intra.42.fr for subject PDF attachments.
   Downloads PDFs, extracts text, tracks word-level diffs.
-  (Skipped automatically if SESSION_COOKIE is not set.)
-
-Both phases write to a single output file (default: data.json)
-that the dashboard auto-loads.
+  Subject version timestamps drive the dashboard activity tracker.
 
 Dependencies:
     pip install -r requirements.txt
 
 Setup:
     cp .env.example .env
-    # Fill in FT_CLIENT_ID, FT_CLIENT_SECRET for API access
+    # Fill in FT_CLIENT_ID, FT_CLIENT_SECRET for first-time API setup
     # Fill in SESSION_COOKIE, USER_ID_COOKIE, CF_CLEARANCE_COOKIE for scraping
 
 Usage:
-    python fetch_42.py                          # full run (projects + subjects)
-    python fetch_42.py --skip-subjects          # project metadata only
+    python fetch_42.py                          # normal run (subjects only)
+    python fetch_42.py --force-setup            # re-run API setup
     python fetch_42.py --keywords "python,dslr" # filter by keyword
     python fetch_42.py --dry-run                # list projects, no downloads
     python fetch_42.py --max 20                 # cap for testing
@@ -180,39 +178,22 @@ def save_data(data: dict, data_file: Path) -> None:
         json.dump(data, f, indent=2, ensure_ascii=False)
 
 
-# ── Project metadata hash ────────────────────────────────────────────────────
-
-def project_metadata_hash(detail: dict) -> str:
-    """Hash the essential project metadata fields to detect changes."""
-    fields = {
-        "name":        detail.get("name"),
-        "slug":        detail.get("slug"),
-        "description": detail.get("description") or "",
-        "exam":        detail.get("exam"),
-        "difficulty":  detail.get("difficulty"),
-        "duration":    detail.get("duration"),
-        "updated_at":  detail.get("updated_at"),
-    }
-    raw = json.dumps(fields, sort_keys=True, ensure_ascii=False)
-    return hashlib.sha256(raw.encode()).hexdigest()
-
-
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Fetch 42 project metadata & subject PDFs — combined tracker"
+        description="Fetch 42 subject PDFs — track changes over time"
     )
-    # API credentials
+    # API credentials (only needed for first-time setup)
     parser.add_argument("--client-id",     default=os.getenv("FT_CLIENT_ID"))
     parser.add_argument("--client-secret", default=os.getenv("FT_CLIENT_SECRET"))
-    # Scraping cookies (optional — subjects phase skipped if missing)
+    # Scraping cookies
     parser.add_argument("--session-cookie",      default=os.getenv("SESSION_COOKIE"))
     parser.add_argument("--user-id-cookie",      default=os.getenv("USER_ID_COOKIE"))
     parser.add_argument("--cf-clearance-cookie",  default=os.getenv("CF_CLEARANCE_COOKIE"))
     # Output
     parser.add_argument("--output",        default=os.getenv("OUTPUT_FILE", "data.json"),
-                        help="Combined output file (projects + history, default: data.json)")
+                        help="Combined output file (default: data.json)")
     parser.add_argument("--subjects-dir",  default=os.getenv("FT_SUBJECTS_DIR", "subjects"))
     # Filters
     parser.add_argument("--keywords",      default=os.getenv("FT_KEYWORDS", ""),
@@ -220,15 +201,11 @@ def main():
     parser.add_argument("--max",           type=int, default=None,
                         help="Cap number of projects (for testing)")
     # Flags
-    parser.add_argument("--skip-subjects", action="store_true",
-                        help="Skip subject PDF fetching (metadata only)")
+    parser.add_argument("--force-setup",   action="store_true",
+                        help="Force re-run of API setup even if data.json exists")
     parser.add_argument("--dry-run",       action="store_true",
                         help="List projects without downloading anything")
     args = parser.parse_args()
-
-    if not args.client_id or not args.client_secret:
-        print("\nError: set FT_CLIENT_ID and FT_CLIENT_SECRET in your .env file.\n")
-        sys.exit(1)
 
     subjects_dir = Path(args.subjects_dir)
     data_file = Path(args.output)
@@ -238,150 +215,93 @@ def main():
     # Load existing combined data (for history continuity)
     existing = load_data(data_file)
     history = existing["history"]
+    projects = existing.get("projects", [])
 
-    # ── Phase 1: API — project metadata ──────────────────────────────────────
-
-    print("\n═══ Phase 1: Project Metadata (API) ═══\n", flush=True)
-
-    print("→ Authenticating…", flush=True)
-    try:
-        api = IntraAPI(args.client_id, args.client_secret)
-    except Exception as e:
-        print(f"  ✗ Authentication failed: {e}", flush=True)
-        print("\n  Checklist:", flush=True)
-        print("  1. https://profile.intra.42.fr/oauth/applications — grant type: Client Credentials", flush=True)
-        print(f"  2. FT_CLIENT_ID     = {args.client_id!r}", flush=True)
-        print(f"  3. FT_CLIENT_SECRET = {'*' * len(args.client_secret)} ({len(args.client_secret)} chars)", flush=True)
-        sys.exit(1)
-    print("  ✓ Token obtained", flush=True)
-
-    print(f"\n→ Fetching projects from cursus {CURSUS_ID} …", flush=True)
-    summaries = api.get_all_pages(f"/v2/cursus/{CURSUS_ID}/projects")
-    print(f"  ✓ {len(summaries)} project(s)", flush=True)
-
-    # Keyword filter
     keywords = parse_keywords(args.keywords)
-    if keywords:
-        before = len(summaries)
-        summaries = [p for p in summaries if matches_keywords(p, keywords)]
-        print(f"\n→ Keyword filter {keywords}: {before} → {len(summaries)} match", flush=True)
-        if not summaries:
-            print("  ⚠ No projects matched.", flush=True)
-            sys.exit(0)
 
-    targets = summaries[:args.max] if args.max else summaries
-    if args.max:
-        print(f"  (capped at {args.max})", flush=True)
+    # ── Initial Setup: API (first run only) ──────────────────────────────────
 
-    if args.dry_run:
-        print("\n[dry-run] Projects:")
-        for p in targets:
-            print(f"  {p.get('slug', p.get('name', '?'))}")
-        return
+    if not projects or args.force_setup:
+        print("\n═══ Initial Setup: Project List (API) ═══\n", flush=True)
 
-    # Fetch full project details
-    print(f"\n→ Fetching details for {len(targets)} project(s) …", flush=True)
-    projects = []
-    details_by_slug = {}
-    for i, p in enumerate(targets, 1):
+        if not args.client_id or not args.client_secret:
+            print("Error: First-time setup requires FT_CLIENT_ID and FT_CLIENT_SECRET in .env\n")
+            print("  After initial setup, API credentials are no longer needed.")
+            sys.exit(1)
+
+        print("→ Authenticating…", flush=True)
         try:
-            detail = api.get(f"/v2/projects/{p['id']}")
-        except Exception as exc:
-            print(f"  [warn] {p.get('slug', p['id'])} failed: {exc} — using summary", flush=True)
-            detail = p
+            api = IntraAPI(args.client_id, args.client_secret)
+        except Exception as e:
+            print(f"  ✗ Authentication failed: {e}", flush=True)
+            sys.exit(1)
+        print("  ✓ Token obtained", flush=True)
 
-        slug = detail.get("slug") or str(detail.get("id"))
-        details_by_slug[slug] = detail
-        projects.append({
-            "id":          detail.get("id"),
-            "name":        detail.get("name"),
-            "slug":        slug,
-            "description": detail.get("description") or "",
-            "updated_at":  detail.get("updated_at"),
-            "created_at":  detail.get("created_at"),
-            "exam":        bool(detail.get("exam")),
-            "difficulty":  detail.get("difficulty"),
-            "duration":    detail.get("duration"),
-            "project_sessions": [
-                {
-                    "id":     s.get("id"),
-                    "campus": s.get("campus", {}).get("name") if s.get("campus") else None,
-                }
-                for s in (detail.get("project_sessions") or [])
-            ],
-        })
+        print(f"\n→ Fetching projects from cursus {CURSUS_ID} …", flush=True)
+        summaries = api.get_all_pages(f"/v2/cursus/{CURSUS_ID}/projects")
+        print(f"  ✓ {len(summaries)} project(s)", flush=True)
 
-        if i % 10 == 0 or i == len(targets):
-            print(f"  [{int(i/len(targets)*100):3d}%] {i}/{len(targets)} — {detail.get('name', '?')}", flush=True)
+        # Keyword filter
+        if keywords:
+            before = len(summaries)
+            summaries = [p for p in summaries if matches_keywords(p, keywords)]
+            print(f"\n→ Keyword filter {keywords}: {before} → {len(summaries)} match", flush=True)
+            if not summaries:
+                print("  ⚠ No projects matched.", flush=True)
+                sys.exit(0)
 
-        time.sleep(0.25)
+        targets = summaries[:args.max] if args.max else summaries
+        if args.max:
+            print(f"  (capped at {args.max})", flush=True)
 
-    # Sort by most recently updated
-    projects.sort(key=lambda p: p.get("updated_at") or "", reverse=True)
+        if args.dry_run:
+            print("\n[dry-run] Projects:")
+            for p in targets:
+                print(f"  {p.get('slug', p.get('name', '?'))}")
+            return
 
-    # ── Track project metadata changes in history ────────────────────────────
-
-    print(f"\n→ Tracking project metadata changes …", flush=True)
-    meta_changes = 0
-
-    for proj in projects:
-        slug = proj["slug"]
-        detail = details_by_slug.get(slug, proj)
-
-        proj_history = history["projects"].setdefault(slug, {
-            "name":     proj["name"],
-            "slug":     slug,
-            "versions": [],
-        })
-
-        # Update name in case it changed
-        proj_history["name"] = proj["name"]
-
-        # Compute hash of current metadata
-        meta_hash = project_metadata_hash(detail)
-
-        # Initialize project_changes list if not present
-        if "project_changes" not in proj_history:
-            proj_history["project_changes"] = []
-
-        # Check if metadata changed since last recorded state
-        last_meta_hash = (
-            proj_history["project_changes"][-1]["hash"]
-            if proj_history["project_changes"]
-            else None
-        )
-
-        if meta_hash != last_meta_hash:
-            proj_history["project_changes"].append({
-                "timestamp":  run_ts,
-                "hash":       meta_hash,
-                "updated_at": detail.get("updated_at"),
+        # Build project list from summaries (fast — no per-project detail fetch)
+        projects = []
+        for p in targets:
+            slug = p.get("slug") or str(p.get("id"))
+            projects.append({
+                "id":          p.get("id"),
+                "name":        p.get("name"),
+                "slug":        slug,
+                "description": p.get("description") or "",
+                "updated_at":  p.get("updated_at"),
+                "created_at":  p.get("created_at"),
+                "exam":        bool(p.get("exam")),
+                "difficulty":  p.get("difficulty"),
+                "duration":    p.get("duration"),
             })
-            proj_history["project_updated_at"] = detail.get("updated_at")
-            meta_changes += 1
 
-    print(f"  ✓ {meta_changes} project(s) with metadata changes detected", flush=True)
+            # Seed history entry with API updated_at as baseline
+            history["projects"].setdefault(slug, {
+                "name":     p.get("name"),
+                "slug":     slug,
+                "project_updated_at": p.get("updated_at"),
+                "versions": [],
+            })
 
-    # Write combined data file (projects + history)
-    output = {
-        "fetched_at": run_ts,
-        "cursus_id":  CURSUS_ID,
-        "total":      len(projects),
-        "projects":   projects,
-        "history":    history,
-    }
-    save_data(output, data_file)
-    print(f"\n  ✓ Saved {len(projects)} projects → {data_file}", flush=True)
+        projects.sort(key=lambda p: p.get("updated_at") or "", reverse=True)
+        print(f"\n  ✓ {len(projects)} projects loaded (initial setup complete)", flush=True)
+        print("  ℹ  API credentials are no longer needed for subsequent runs.", flush=True)
+    else:
+        print(f"\n═══ Projects already loaded ({len(projects)}) — skipping API setup ═══\n", flush=True)
+        if args.dry_run:
+            print("[dry-run] Projects:")
+            for p in projects:
+                print(f"  {p.get('slug', p.get('name', '?'))}")
+            return
 
-    # ── Phase 2: Subject PDFs (scraping) ─────────────────────────────────────
+    # ── Subject PDFs (scraping — every run) ──────────────────────────────────
 
-    if args.skip_subjects:
-        print("\n  [skip] Subject fetching skipped (--skip-subjects)", flush=True)
-    elif not args.session_cookie:
-        print("\n  [skip] Subject fetching skipped — no SESSION_COOKIE set.", flush=True)
+    if not args.session_cookie:
+        print("  [skip] Subject fetching skipped — no SESSION_COOKIE set.", flush=True)
         print("         Set SESSION_COOKIE in .env to enable subject tracking.", flush=True)
     else:
-        print("\n═══ Phase 2: Subject PDFs (Scraping) ═══\n", flush=True)
+        print("═══ Subject PDFs (Scraping) ═══\n", flush=True)
 
         cookies = {'_intra_42_session_production': args.session_cookie}
         if args.user_id_cookie:
@@ -452,8 +372,6 @@ def main():
                     "slug":     slug,
                     "versions": [],
                 })
-                if "project_changes" not in proj_history:
-                    proj_history["project_changes"] = []
 
                 last_hash = proj_history["versions"][-1]["hash"] if proj_history["versions"] else None
                 if pdf_hash == last_hash:
@@ -501,14 +419,27 @@ def main():
                 })
 
                 changed += 1
-                output["history"] = history
+                # Incremental save after each change
+                output = {
+                    "fetched_at": run_ts,
+                    "cursus_id":  CURSUS_ID,
+                    "total":      len(projects),
+                    "projects":   projects,
+                    "history":    history,
+                }
                 save_data(output, data_file)
                 time.sleep(0.5)
 
             print(f"\n  ✓ Subjects — {changed} changed, {skipped} no PDF, {errors} errors", flush=True)
 
     # Final save
-    output["history"] = history
+    output = {
+        "fetched_at": run_ts,
+        "cursus_id":  CURSUS_ID,
+        "total":      len(projects),
+        "projects":   projects,
+        "history":    history,
+    }
     save_data(output, data_file)
 
     print(f"\n{'═' * 50}")
